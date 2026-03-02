@@ -1,4 +1,4 @@
-name: Build (client + server) - Windows + Ubuntu 22+
+name: Build (client + server) - Ubuntu (Linux + Windows artifacts)
 
 on:
   push:
@@ -13,27 +13,16 @@ env:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
-
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: ubuntu-22.04-x86_64
-            runner: ubuntu-22.04
+          - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
             artifact_base: slipstream-ubuntu-22.04-x86_64
-
-          - name: ubuntu-24.04-x86_64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            artifact_base: slipstream-ubuntu-24.04-x86_64
-
-          # Windows via MinGW (برای picoquic/picotls راحت‌تره)
           - name: windows-x86_64-gnu
-            runner: windows-latest
             target: x86_64-pc-windows-gnu
             artifact_base: slipstream-windows-x86_64-gnu
 
@@ -43,26 +32,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install build deps (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Install deps (Linux + Windows cross)
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev python3
-
-      - name: Setup MSYS2 (Windows)
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            git
-            base-devel
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-pkgconf
+          sudo apt-get install -y \
+            cmake pkg-config python3 \
+            libssl-dev \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -75,91 +51,28 @@ jobs:
           shared-key: ${{ matrix.name }}
           cache-on-failure: true
 
-      # ✅ Pre-build picoquic (Windows) + shim arpa/inet.h
-      - name: Build picoquic (Windows, MSYS2 bash)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-
-          # ---- Create shim for <arpa/inet.h> on Windows ----
-          shim="$GITHUB_WORKSPACE/.win-shims"
-          mkdir -p "$shim/arpa"
-          cat > "$shim/arpa/inet.h" <<'EOF'
-          #pragma once
-          /* Shim for code expecting <arpa/inet.h> on Unix.
-             On Windows use Winsock headers (inet_pton/inet_ntop etc). */
-          #ifndef WIN32_LEAN_AND_MEAN
-          #define WIN32_LEAN_AND_MEAN
-          #endif
-          #include <winsock2.h>
-          #include <ws2tcpip.h>
-          EOF
-
-          # Ensure libpthread.a exists (some builds expect -lpthread)
-          if [[ ! -f /mingw64/lib/libpthread.a && -f /mingw64/lib/libwinpthread.a ]]; then
-            cp /mingw64/lib/libwinpthread.a /mingw64/lib/libpthread.a
-          fi
-
-          export PICOQUIC_DIR="$GITHUB_WORKSPACE/vendor/picoquic"
-          export PICOQUIC_BUILD_DIR="$GITHUB_WORKSPACE/.picoquic-build"
-          export PICOQUIC_TARGET="${{ matrix.target }}"
-
-          # OpenSSL from MSYS2 mingw64
-          export OPENSSL_ROOT_DIR="/mingw64"
-          export OPENSSL_INCLUDE_DIR="/mingw64/include"
-          export OPENSSL_USE_STATIC_LIBS="TRUE"
-
-          # Make sure CMake sees the shim include path first
-          export CFLAGS="-I$shim ${CFLAGS:-}"
-          export CXXFLAGS="-I$shim ${CXXFLAGS:-}"
-
-          bash "$GITHUB_WORKSPACE/scripts/build_picoquic.sh"
-
       - name: Build (release) - client
-        shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            export PICOQUIC_AUTO_BUILD=0
-            export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
-            export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
-            export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
-            cargo build -p slipstream-client --release --target "${{ matrix.target }}" \
-              --features "slipstream-ffi/openssl-static"
-          else
-            cargo build -p slipstream-client --release --target "${{ matrix.target }}"
-          fi
+          cargo build -p slipstream-client --release --target "${{ matrix.target }}"
 
       - name: Build (release) - server
-        shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            export PICOQUIC_AUTO_BUILD=0
-            export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
-            export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
-            export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
-            cargo build -p slipstream-server --release --target "${{ matrix.target }}" \
-              --features "slipstream-ffi/openssl-static"
-          else
-            cargo build -p slipstream-server --release --target "${{ matrix.target }}"
-          fi
+          cargo build -p slipstream-server --release --target "${{ matrix.target }}"
 
       - name: Package artifacts
-        shell: bash
         run: |
           set -euo pipefail
           dist="dist"
           mkdir -p "$dist"
           bin_dir="target/${{ matrix.target }}/release"
 
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
             cp "${bin_dir}/slipstream-client.exe" "$dist/"
             cp "${bin_dir}/slipstream-server.exe" "$dist/"
-            (cd "$dist" && (sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null || true))
-            (cd "$dist" && (certutil -hashfile slipstream-client.exe SHA256; certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true)
-            (cd "$dist" && 7z a "../${{ matrix.artifact_base }}.zip" .)
+            (cd "$dist" && sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256")
+            (cd "$dist" && zip -r "../${{ matrix.artifact_base }}.zip" .)
           else
             cp "${bin_dir}/slipstream-client" "$dist/"
             cp "${bin_dir}/slipstream-server" "$dist/"
@@ -175,5 +88,4 @@ jobs:
             ${{ matrix.artifact_base }}.tar.gz
             ${{ matrix.artifact_base }}.zip
             dist/*.sha256
-            dist/*.sha256.txt
           if-no-files-found: error
