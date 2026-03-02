@@ -1,0 +1,110 @@
+name: Build (client + server)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # اگر خواستی auto-build picoquic رو خاموش کنی اینو 0 کن:
+  # PICOQUIC_AUTO_BUILD: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-22.04-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_base: slipstream-ubuntu-22.04-x86_64
+
+          - name: ubuntu-24.04-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact_base: slipstream-ubuntu-24.04-x86_64
+
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_base: slipstream-windows-x86_64
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev python3
+
+      # روی ویندوز برای اینکه build اسکریپت‌ها/ساب‌ماژول‌ها راحت‌تر کار کنن،
+      # از bash (که روی runner هست) استفاده می‌کنیم و Rust رو نصب می‌کنیم.
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cache برای سریع‌تر شدن بیلدها
+      - name: Cache cargo + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.name }}
+          cache-on-failure: true
+
+      - name: Build (release) - client
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p slipstream-client --release --target "${{ matrix.target }}"
+
+      - name: Build (release) - server
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p slipstream-server --release --target "${{ matrix.target }}"
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dist="dist"
+          mkdir -p "$dist"
+          bin_dir="target/${{ matrix.target }}/release"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "${bin_dir}/slipstream-client.exe" "$dist/"
+            cp "${bin_dir}/slipstream-server.exe" "$dist/"
+            (cd "$dist" && sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null) || true
+            (cd "$dist" && certutil -hashfile slipstream-client.exe SHA256 && certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true
+            (cd "$dist" && 7z a "../${{ matrix.artifact_base }}.zip" .)
+          else
+            cp "${bin_dir}/slipstream-client" "$dist/"
+            cp "${bin_dir}/slipstream-server" "$dist/"
+            (cd "$dist" && sha256sum slipstream-client slipstream-server > "${{ matrix.artifact_base }}.sha256")
+            tar -czf "${{ matrix.artifact_base }}.tar.gz" -C "$dist" .
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_base }}
+          path: |
+            ${{ matrix.artifact_base }}.tar.gz
+            ${{ matrix.artifact_base }}.zip
+            dist/*.sha256
+            dist/*.sha256.txt
+          if-no-files-found: error
