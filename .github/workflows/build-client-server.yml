@@ -31,7 +31,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_base: slipstream-ubuntu-24.04-x86_64
 
-          # ✅ Windows build via GNU toolchain (msys2/mingw64)
+          # Windows via MinGW (برای picoquic/picotls راحت‌تره)
           - name: windows-x86_64-gnu
             runner: windows-latest
             target: x86_64-pc-windows-gnu
@@ -49,7 +49,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev python3
 
-      # ✅ MSYS2 toolchain + deps (Windows)
       - name: Setup MSYS2 (Windows)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
@@ -76,15 +75,28 @@ jobs:
           shared-key: ${{ matrix.name }}
           cache-on-failure: true
 
-      # ✅ Pre-build picoquic on Windows using bash, then disable auto-build inside build.rs
+      # ✅ Pre-build picoquic (Windows) + shim arpa/inet.h
       - name: Build picoquic (Windows, MSYS2 bash)
         if: runner.os == 'Windows'
         shell: msys2 {0}
         run: |
           set -euo pipefail
 
-          # بعضی وقت‌ها -lpthread می‌خواد. در mingw معمولاً winpthread هست.
-          # اگر libpthread.a وجود نداشت، یه alias می‌سازیم.
+          # ---- Create shim for <arpa/inet.h> on Windows ----
+          shim="$GITHUB_WORKSPACE/.win-shims"
+          mkdir -p "$shim/arpa"
+          cat > "$shim/arpa/inet.h" <<'EOF'
+          #pragma once
+          /* Shim for code expecting <arpa/inet.h> on Unix.
+             On Windows use Winsock headers (inet_pton/inet_ntop etc). */
+          #ifndef WIN32_LEAN_AND_MEAN
+          #define WIN32_LEAN_AND_MEAN
+          #endif
+          #include <winsock2.h>
+          #include <ws2tcpip.h>
+          EOF
+
+          # Ensure libpthread.a exists (some builds expect -lpthread)
           if [[ ! -f /mingw64/lib/libpthread.a && -f /mingw64/lib/libwinpthread.a ]]; then
             cp /mingw64/lib/libwinpthread.a /mingw64/lib/libpthread.a
           fi
@@ -98,41 +110,36 @@ jobs:
           export OPENSSL_INCLUDE_DIR="/mingw64/include"
           export OPENSSL_USE_STATIC_LIBS="TRUE"
 
+          # Make sure CMake sees the shim include path first
+          export CFLAGS="-I$shim ${CFLAGS:-}"
+          export CXXFLAGS="-I$shim ${CXXFLAGS:-}"
+
           bash "$GITHUB_WORKSPACE/scripts/build_picoquic.sh"
 
-      # ✅ Build (release) - client
       - name: Build (release) - client
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            # مهم: build.rs نباید خودش .sh رو اجرا کنه
             export PICOQUIC_AUTO_BUILD=0
             export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
             export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
             export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
-
-            # برای لینک بهتر روی gnu، openssl رو static کن
-            # (feature داخل slipstream-ffi تعریف شده)
             cargo build -p slipstream-client --release --target "${{ matrix.target }}" \
               --features "slipstream-ffi/openssl-static"
           else
             cargo build -p slipstream-client --release --target "${{ matrix.target }}"
           fi
 
-      # ✅ Build (release) - server
       - name: Build (release) - server
         shell: bash
         run: |
           set -euo pipefail
-
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             export PICOQUIC_AUTO_BUILD=0
             export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
             export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
             export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
-
             cargo build -p slipstream-server --release --target "${{ matrix.target }}" \
               --features "slipstream-ffi/openssl-static"
           else
@@ -143,7 +150,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           dist="dist"
           mkdir -p "$dist"
           bin_dir="target/${{ matrix.target }}/release"
@@ -151,15 +157,12 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "${bin_dir}/slipstream-client.exe" "$dist/"
             cp "${bin_dir}/slipstream-server.exe" "$dist/"
-
             (cd "$dist" && (sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null || true))
             (cd "$dist" && (certutil -hashfile slipstream-client.exe SHA256; certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true)
-
             (cd "$dist" && 7z a "../${{ matrix.artifact_base }}.zip" .)
           else
             cp "${bin_dir}/slipstream-client" "$dist/"
             cp "${bin_dir}/slipstream-server" "$dist/"
-
             (cd "$dist" && sha256sum slipstream-client slipstream-server > "${{ matrix.artifact_base }}.sha256")
             tar -czf "${{ matrix.artifact_base }}.tar.gz" -C "$dist" .
           fi
