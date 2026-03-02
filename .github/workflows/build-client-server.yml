@@ -1,8 +1,9 @@
-name: Build (client + server) - Ubuntu (Linux + Windows)
+name: Release Builds
 
 on:
   push:
-  pull_request:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -10,98 +11,157 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux (glibc)
           - name: linux-x86_64
+            runs_on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_base: slipstream-ubuntu-22.04-x86_64
+            exe_ext: ""
 
+          # macOS Intel
+          - name: macos-x86_64
+            runs_on: macos-latest
+            target: x86_64-apple-darwin
+            exe_ext: ""
+
+          # macOS Apple Silicon
+          - name: macos-aarch64
+            runs_on: macos-latest
+            target: aarch64-apple-darwin
+            exe_ext: ""
+
+          # Windows MSVC
+          - name: windows-x86_64-msvc
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe_ext: ".exe"
+
+          # Windows GNU (cross-compile on Ubuntu with mingw-w64)
           - name: windows-x86_64-gnu
+            runs_on: ubuntu-latest
             target: x86_64-pc-windows-gnu
-            artifact_base: slipstream-windows-x86_64-gnu
-
-    name: ${{ matrix.name }}
+            exe_ext: ".exe"
+            needs_mingw: true
 
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Install deps (Linux + Windows cross)
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            cmake pkg-config python3 \
-            libssl-dev \
-            perl make nasm \
-            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libclang-dev clang \
+            libbrotli-dev
 
-      - name: Set up Rust
+      - name: Install MinGW-w64 (for windows-gnu)
+        if: matrix.needs_mingw == true
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew update
+          brew install cmake ninja pkg-config brotli || true
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo + build
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v4
         with:
-          shared-key: ${{ matrix.name }}
-          cache-on-failure: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            .picoquic-build
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      - name: Configure toolchain env for windows-gnu
+        if: matrix.needs_mingw == true
+        run: |
+          set -euo pipefail
+          echo "CC=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          echo "CXX=x86_64-w64-mingw32-g++" >> $GITHUB_ENV
+          echo "AR=x86_64-w64-mingw32-ar" >> $GITHUB_ENV
+          echo "RANLIB=x86_64-w64-mingw32-ranlib" >> $GITHUB_ENV
+          echo "STRIP=x86_64-w64-mingw32-strip" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          # (اختیاری ولی کمک‌کننده برای CMake)
+          echo "CMAKE_C_COMPILER=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++" >> $GITHUB_ENV
+
+      - name: Clean picoquic build dir (windows-gnu only)
+        if: matrix.needs_mingw == true
+        run: |
+          set -euo pipefail
+          rm -rf .picoquic-build
+
+      # ---- BUILD ----
       - name: Build (release) - client
+        shell: bash
         run: |
           set -euo pipefail
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
-            # برای کراس‌کامپایل ویندوز: OpenSSL رو vendored بساز (بدون pkg-config/sysroot)
-            cargo build -p slipstream-client --release --target "${{ matrix.target }}" \
-              --features "openssl-vendored"
+            cargo build -p slipstream-client --release --target "${{ matrix.target }}" --features "openssl-vendored"
           else
             cargo build -p slipstream-client --release --target "${{ matrix.target }}"
           fi
 
       - name: Build (release) - server
+        shell: bash
         run: |
           set -euo pipefail
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
-            cargo build -p slipstream-server --release --target "${{ matrix.target }}" \
-              --features "openssl-vendored"
+            cargo build -p slipstream-server --release --target "${{ matrix.target }}" --features "openssl-vendored"
           else
             cargo build -p slipstream-server --release --target "${{ matrix.target }}"
           fi
 
+      # ---- PACKAGE ----
       - name: Package artifacts
+        shell: bash
         run: |
           set -euo pipefail
-          dist="dist"
-          mkdir -p "$dist"
-          bin_dir="target/${{ matrix.target }}/release"
+          mkdir -p dist
 
+          cp "target/${{ matrix.target }}/release/slipstream-client${{ matrix.exe_ext }}" "dist/slipstream-client-${{ matrix.name }}${{ matrix.exe_ext }}"
+          cp "target/${{ matrix.target }}/release/slipstream-server${{ matrix.exe_ext }}" "dist/slipstream-server-${{ matrix.name }}${{ matrix.exe_ext }}"
+
+          # اختیاری: strip روی لینوکس و windows-gnu
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            strip "dist/slipstream-client-${{ matrix.name }}"
+            strip "dist/slipstream-server-${{ matrix.name }}"
+          fi
           if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
-            cp "${bin_dir}/slipstream-client.exe" "$dist/"
-            cp "${bin_dir}/slipstream-server.exe" "$dist/"
-            (cd "$dist" && sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256")
-            (cd "$dist" && zip -r "../${{ matrix.artifact_base }}.zip" .)
-          else
-            cp "${bin_dir}/slipstream-client" "$dist/"
-            cp "${bin_dir}/slipstream-server" "$dist/"
-            (cd "$dist" && sha256sum slipstream-client slipstream-server > "${{ matrix.artifact_base }}.sha256")
-            tar -czf "${{ matrix.artifact_base }}.tar.gz" -C "$dist" .
+            x86_64-w64-mingw32-strip "dist/slipstream-client-${{ matrix.name }}.exe" || true
+            x86_64-w64-mingw32-strip "dist/slipstream-server-${{ matrix.name }}.exe" || true
           fi
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_base }}
-          path: |
-            ${{ matrix.artifact_base }}.tar.gz
-            ${{ matrix.artifact_base }}.zip
-            dist/*.sha256
+          name: slipstream-${{ matrix.name }}
+          path: dist/*
           if-no-files-found: error
