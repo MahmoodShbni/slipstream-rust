@@ -1,4 +1,4 @@
-name: Build (client + server)
+name: Build (client + server) - Windows + Ubuntu 22+
 
 on:
   push:
@@ -10,8 +10,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # اگر خواستی auto-build picoquic رو خاموش کنی اینو 0 کن:
-  # PICOQUIC_AUTO_BUILD: "0"
 
 jobs:
   build:
@@ -50,19 +48,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev python3
 
-      # روی ویندوز برای اینکه build اسکریپت‌ها/ساب‌ماژول‌ها راحت‌تر کار کنن،
-      # از bash (که روی runner هست) استفاده می‌کنیم و Rust رو نصب می‌کنیم.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # Cache برای سریع‌تر شدن بیلدها
       - name: Cache cargo + build
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.name }}
           cache-on-failure: true
+
+      # ✅ Fix Windows OpenSSL (openssl-sys) using vcpkg
+      - name: Setup vcpkg + OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat"
+          & "$vcpkgRoot\vcpkg.exe" install openssl:x64-windows
+
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_DEFAULT_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # کمک می‌کنه openssl به صورت dll لینک بشه (سازگارتر روی ویندوز)
+          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build (release) - client
         shell: bash
@@ -88,13 +98,20 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "${bin_dir}/slipstream-client.exe" "$dist/"
             cp "${bin_dir}/slipstream-server.exe" "$dist/"
-            (cd "$dist" && sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null) || true
-            (cd "$dist" && certutil -hashfile slipstream-client.exe SHA256 && certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true
+
+            # sha256 (روی ویندوز ممکنه sha256sum نباشه؛ certutil هم خروجی txt می‌ده)
+            (cd "$dist" && (sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null || true))
+            (cd "$dist" && (certutil -hashfile slipstream-client.exe SHA256; certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true)
+
+            # zip
             (cd "$dist" && 7z a "../${{ matrix.artifact_base }}.zip" .)
           else
             cp "${bin_dir}/slipstream-client" "$dist/"
             cp "${bin_dir}/slipstream-server" "$dist/"
+
             (cd "$dist" && sha256sum slipstream-client slipstream-server > "${{ matrix.artifact_base }}.sha256")
+
+            # tar.gz
             tar -czf "${{ matrix.artifact_base }}.tar.gz" -C "$dist" .
           fi
 
