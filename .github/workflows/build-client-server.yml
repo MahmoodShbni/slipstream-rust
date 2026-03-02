@@ -31,10 +31,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_base: slipstream-ubuntu-24.04-x86_64
 
-          - name: windows-x86_64
+          # ✅ Windows build via GNU toolchain (msys2/mingw64)
+          - name: windows-x86_64-gnu
             runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_base: slipstream-windows-x86_64
+            target: x86_64-pc-windows-gnu
+            artifact_base: slipstream-windows-x86_64-gnu
 
     steps:
       - name: Checkout (with submodules)
@@ -48,6 +49,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev python3
 
+      # ✅ MSYS2 toolchain + deps (Windows)
+      - name: Setup MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkgconf
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,32 +76,68 @@ jobs:
           shared-key: ${{ matrix.name }}
           cache-on-failure: true
 
-      # ✅ Fix Windows OpenSSL (openssl-sys) using vcpkg
-      - name: Setup vcpkg + OpenSSL (Windows)
+      # ✅ Pre-build picoquic on Windows using bash, then disable auto-build inside build.rs
+      - name: Build picoquic (Windows, MSYS2 bash)
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: msys2 {0}
         run: |
-          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
-          git clone https://github.com/microsoft/vcpkg $vcpkgRoot
-          & "$vcpkgRoot\bootstrap-vcpkg.bat"
-          & "$vcpkgRoot\vcpkg.exe" install openssl:x64-windows
+          set -euo pipefail
 
-          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKG_DEFAULT_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append
-          # کمک می‌کنه openssl به صورت dll لینک بشه (سازگارتر روی ویندوز)
-          "VCPKGRS_DYNAMIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # بعضی وقت‌ها -lpthread می‌خواد. در mingw معمولاً winpthread هست.
+          # اگر libpthread.a وجود نداشت، یه alias می‌سازیم.
+          if [[ ! -f /mingw64/lib/libpthread.a && -f /mingw64/lib/libwinpthread.a ]]; then
+            cp /mingw64/lib/libwinpthread.a /mingw64/lib/libpthread.a
+          fi
 
+          export PICOQUIC_DIR="$GITHUB_WORKSPACE/vendor/picoquic"
+          export PICOQUIC_BUILD_DIR="$GITHUB_WORKSPACE/.picoquic-build"
+          export PICOQUIC_TARGET="${{ matrix.target }}"
+
+          # OpenSSL from MSYS2 mingw64
+          export OPENSSL_ROOT_DIR="/mingw64"
+          export OPENSSL_INCLUDE_DIR="/mingw64/include"
+          export OPENSSL_USE_STATIC_LIBS="TRUE"
+
+          bash "$GITHUB_WORKSPACE/scripts/build_picoquic.sh"
+
+      # ✅ Build (release) - client
       - name: Build (release) - client
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p slipstream-client --release --target "${{ matrix.target }}"
 
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            # مهم: build.rs نباید خودش .sh رو اجرا کنه
+            export PICOQUIC_AUTO_BUILD=0
+            export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
+            export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
+            export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
+
+            # برای لینک بهتر روی gnu، openssl رو static کن
+            # (feature داخل slipstream-ffi تعریف شده)
+            cargo build -p slipstream-client --release --target "${{ matrix.target }}" \
+              --features "slipstream-ffi/openssl-static"
+          else
+            cargo build -p slipstream-client --release --target "${{ matrix.target }}"
+          fi
+
+      # ✅ Build (release) - server
       - name: Build (release) - server
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p slipstream-server --release --target "${{ matrix.target }}"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            export PICOQUIC_AUTO_BUILD=0
+            export PICOQUIC_INCLUDE_DIR="$GITHUB_WORKSPACE/vendor/picoquic/picoquic"
+            export PICOQUIC_LIB_DIR="$GITHUB_WORKSPACE/.picoquic-build"
+            export PICOTLS_INCLUDE_DIR="$GITHUB_WORKSPACE/.picoquic-build/_deps/picotls-src/include"
+
+            cargo build -p slipstream-server --release --target "${{ matrix.target }}" \
+              --features "slipstream-ffi/openssl-static"
+          else
+            cargo build -p slipstream-server --release --target "${{ matrix.target }}"
+          fi
 
       - name: Package artifacts
         shell: bash
@@ -99,19 +152,15 @@ jobs:
             cp "${bin_dir}/slipstream-client.exe" "$dist/"
             cp "${bin_dir}/slipstream-server.exe" "$dist/"
 
-            # sha256 (روی ویندوز ممکنه sha256sum نباشه؛ certutil هم خروجی txt می‌ده)
             (cd "$dist" && (sha256sum slipstream-client.exe slipstream-server.exe > "${{ matrix.artifact_base }}.sha256" 2>/dev/null || true))
             (cd "$dist" && (certutil -hashfile slipstream-client.exe SHA256; certutil -hashfile slipstream-server.exe SHA256) > "${{ matrix.artifact_base }}.sha256.txt" || true)
 
-            # zip
             (cd "$dist" && 7z a "../${{ matrix.artifact_base }}.zip" .)
           else
             cp "${bin_dir}/slipstream-client" "$dist/"
             cp "${bin_dir}/slipstream-server" "$dist/"
 
             (cd "$dist" && sha256sum slipstream-client slipstream-server > "${{ matrix.artifact_base }}.sha256")
-
-            # tar.gz
             tar -czf "${{ matrix.artifact_base }}.tar.gz" -C "$dist" .
           fi
 
