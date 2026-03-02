@@ -1,4 +1,4 @@
-name: Build (client + server) - Ubuntu (Linux + Windows artifacts)
+name: Build (client + server) - Ubuntu (Linux + Windows)
 
 on:
   push:
@@ -15,6 +15,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+
     strategy:
       fail-fast: false
       matrix:
@@ -22,9 +23,12 @@ jobs:
           - name: linux-x86_64
             target: x86_64-unknown-linux-gnu
             artifact_base: slipstream-ubuntu-22.04-x86_64
+
           - name: windows-x86_64-gnu
             target: x86_64-pc-windows-gnu
             artifact_base: slipstream-windows-x86_64-gnu
+
+    name: ${{ matrix.name }}
 
     steps:
       - name: Checkout (with submodules)
@@ -38,6 +42,7 @@ jobs:
           sudo apt-get install -y \
             cmake pkg-config python3 \
             libssl-dev \
+            perl make nasm \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 
       - name: Set up Rust
@@ -54,12 +59,23 @@ jobs:
       - name: Build (release) - client
         run: |
           set -euo pipefail
-          cargo build -p slipstream-client --release --target "${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+            # برای کراس‌کامپایل ویندوز: OpenSSL رو vendored بساز (بدون pkg-config/sysroot)
+            cargo build -p slipstream-client --release --target "${{ matrix.target }}" \
+              --features "openssl-vendored"
+          else
+            cargo build -p slipstream-client --release --target "${{ matrix.target }}"
+          fi
 
       - name: Build (release) - server
         run: |
           set -euo pipefail
-          cargo build -p slipstream-server --release --target "${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-gnu" ]]; then
+            cargo build -p slipstream-server --release --target "${{ matrix.target }}" \
+              --features "openssl-vendored"
+          else
+            cargo build -p slipstream-server --release --target "${{ matrix.target }}"
+          fi
 
       - name: Package artifacts
         run: |
