@@ -1,6 +1,11 @@
 use crate::types::{DnsError, Rcode};
 
-pub(crate) const MAX_DNS_NAME_LEN: usize = 253;
+/// Maximum total length of a DNS query name (FQDN), in characters.
+/// RFC 1035 allows up to 253, but this build is capped at 151 to work
+/// within restricted DNS resolver environments.
+/// Changing this value automatically adjusts payload limits everywhere
+/// (`max_payload_len_for_domain`, `encode_name`, `parse_name`).
+pub(crate) const MAX_DNS_NAME_LEN: usize = 151;
 
 fn extract_subdomain(qname: &str, domain: &str) -> Result<String, Rcode> {
     let domain = domain.trim_end_matches('.');
@@ -190,31 +195,39 @@ mod tests {
     use super::{encode_name, parse_name};
 
     fn build_name(last_label_len: usize) -> String {
+        // Two max-length labels (63 chars each) + separator dots = 63+1+63+1 = 128 chars.
+        // Adding a third label of `last_label_len` gives 128 + 1 + last_label_len chars total.
+        // At last_label_len=22: 128+1+22 = 151 == MAX_DNS_NAME_LEN (exactly at limit).
+        // At last_label_len=23: 152 > MAX_DNS_NAME_LEN (over limit).
         format!(
-            "{}.{}.{}.{}.",
+            "{}.{}.{}.",
             "a".repeat(63),
             "b".repeat(63),
-            "c".repeat(63),
-            "d".repeat(last_label_len)
+            "c".repeat(last_label_len)
         )
     }
 
     #[test]
     fn encode_name_rejects_long_name() {
         let mut out = Vec::new();
-        let max_name = build_name(61);
+        let max_name = build_name(23);
         assert!(max_name.trim_end_matches('.').len() == MAX_DNS_NAME_LEN);
         assert!(encode_name(&max_name, &mut out).is_ok());
 
         let mut out = Vec::new();
-        let too_long = build_name(62);
+        let too_long = build_name(24);
         assert!(encode_name(&too_long, &mut out).is_err());
     }
 
     #[test]
     fn parse_name_rejects_long_name() {
+        // [63, 63, 22] → name_len = 63+1+63+1+22 = 150... wait that's 150.
+        // Dots between labels count: 63+1+63+1+22 = 150, but encode tracks without leading dot.
+        // The loop adds 1 for each separator *after* first label, so: 63 + (1+63) + (1+22) = 150.
+        // To hit exactly 151: use [63, 63, 23] → 63 + 1+63 + 1+23 = 151 ✓ (ok at limit)
+        // [63, 63, 24] → 152 ✗ (over limit)
         let mut packet = Vec::new();
-        let labels = [63usize, 63, 63, 61];
+        let labels = [63usize, 63, 23];
         for len in labels {
             packet.push(len as u8);
             packet.extend(std::iter::repeat_n(b'a', len));
@@ -223,7 +236,7 @@ mod tests {
         assert!(parse_name(&packet, 0).is_ok());
 
         let mut packet = Vec::new();
-        let labels = [63usize, 63, 63, 62];
+        let labels = [63usize, 63, 24];
         for len in labels {
             packet.push(len as u8);
             packet.extend(std::iter::repeat_n(b'a', len));

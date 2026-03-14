@@ -4,12 +4,18 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::net::{TcpListener as TokioTcpListener, UdpSocket as TokioUdpSocket};
 
 pub(crate) fn compute_mtu(domain_len: usize) -> Result<u32, ClientError> {
-    if domain_len >= 240 {
+    // DNS name limit is 151 chars. The data portion is:
+    //   limit - domain_len - 2 dots - safety margin (8) = 141 - domain_len usable encoded chars.
+    // Divided by base32 expansion (~1.6×) gives raw payload bytes per packet.
+    const DNS_NAME_LIMIT: usize = 151;
+    const OVERHEAD: usize = 10; // 2 dots + base32 dot-insertion overhead + safety margin
+    let max_encoded = DNS_NAME_LIMIT.saturating_sub(OVERHEAD);
+    if domain_len >= max_encoded {
         return Err(ClientError::new(
             "Domain name is too long for DNS transport",
         ));
     }
-    let mtu = ((240.0 - domain_len as f64) / 1.6) as u32;
+    let mtu = ((max_encoded - domain_len) as f64 / 1.6) as u32;
     if mtu == 0 {
         return Err(ClientError::new(
             "MTU computed to zero; check domain length",
