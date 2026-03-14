@@ -18,7 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux x86_64 ──────────────────────────────────────────────────
           # ubuntu-22.04 = glibc 2.35 → binary runs on 22.04 and any newer release.
           - name: linux-amd64
             runner: ubuntu-22.04
@@ -26,7 +25,6 @@ jobs:
             artifact_name: slipstream-linux-amd64
             exe_ext: ""
 
-          # ── Windows x86_64 ───────────────────────────────────────────────
           - name: windows-amd64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
@@ -34,7 +32,6 @@ jobs:
             exe_ext: ".exe"
 
     steps:
-      # ── Source ─────────────────────────────────────────────────────────────
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -57,94 +54,116 @@ jobs:
 
       # ════════════════════════════════════════════════════════════════════════
       # WINDOWS
+      #
+      # All Windows steps use shell: pwsh (PowerShell) — NOT Git Bash.
+      # Git Bash mangles Windows paths when they pass through find|xargs|grep,
+      # stripping drive-letter slashes (D:/a/... → D:a...) which makes grep
+      # report "No such file or directory" and exit 123. PowerShell uses
+      # native Windows paths throughout and has no such conversion issue.
       # ════════════════════════════════════════════════════════════════════════
-
-      # cmake + ninja are pre-installed. strawberryperl gives us a Perl that
-      # openssl-src needs to configure OpenSSL. pkgconfiglite provides pkg-config.
       - name: Install build dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install pkgconfiglite strawberryperl --no-progress -y
-          # Expose Strawberry Perl on PATH so openssl-src can find it
           $perl = "C:\Strawberry\perl\bin"
           if (Test-Path $perl) {
-            echo "$perl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            "$perl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
-      # Build picoquic with MSVC (Visual Studio 17 2022).
-      # Git Bash is available on all windows-latest runners — use it to run
-      # the bash script without needing MSYS2.
+      # Build picoquic with MSVC. Two-pass cmake:
+      #   Pass 1 – configure only (may fail), which triggers FetchContent to
+      #            download picotls into .picoquic-build/_deps/picotls-src.
+      #   Patch  – replace #include <arpa/inet.h> (POSIX-only, absent on MSVC)
+      #            with a _WIN32-guarded <winsock2.h> in every picotls file.
+      #   Pass 2 – full configure + build.
       - name: Build picoquic (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          PICOQUIC_DIR="${GITHUB_WORKSPACE}/vendor/picoquic"
-          BUILD_DIR="${GITHUB_WORKSPACE}/.picoquic-build"
+          $PicoquicDir = "$env:GITHUB_WORKSPACE\vendor\picoquic"
+          $BuildDir    = "$env:GITHUB_WORKSPACE\.picoquic-build"
 
-          CMAKE_ARGS=(
-            -S "$PICOQUIC_DIR"
-            -B "$BUILD_DIR"
-            -G "Visual Studio 17 2022" -A x64
-            -DCMAKE_BUILD_TYPE=Release
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-            -DPICOQUIC_FETCH_PTLS=ON
-            -DBUILD_TESTING=OFF
-            -Dpicoquic_BUILD_TESTS=OFF
-            -Wno-dev
+          $CmakeArgs = @(
+            "-S", $PicoquicDir,
+            "-B", $BuildDir,
+            "-G", "Visual Studio 17 2022", "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DPICOQUIC_FETCH_PTLS=ON",
+            "-DBUILD_TESTING=OFF",
+            "-Dpicoquic_BUILD_TESTS=OFF",
+            "-Wno-dev"
           )
 
-          # First cmake run fetches picotls via FetchContent
-          cmake "${CMAKE_ARGS[@]}" || true
+          # Pass 1: fetch picotls (ignore cmake exit code)
+          cmake @CmakeArgs; $true
 
-          # ── Patch picotls: arpa/inet.h does not exist on Windows ──────────
-          # picotls/lib/picotls.c includes <arpa/inet.h> which is POSIX-only.
-          # Replace it with <winsock2.h> inside a WIN32 guard.
-          PTLS_C="$BUILD_DIR/_deps/picotls-src/lib/picotls.c"
-          if [ -f "$PTLS_C" ]; then
-            sed -i 's|#include <arpa/inet.h>|#ifdef _WIN32\n#include <winsock2.h>\n#else\n#include <arpa/inet.h>\n#endif|g' "$PTLS_C"
-          fi
+          # Patch every picotls .c/.h that includes arpa/inet.h
+          $ptlsSrc = "$BuildDir\_deps\picotls-src"
+          if (Test-Path $ptlsSrc) {
+            Get-ChildItem -Path $ptlsSrc -Recurse -Include "*.c","*.h" |
+              Where-Object { Select-String -Path $_.FullName -Pattern "arpa/inet\.h" -Quiet } |
+              ForEach-Object {
+                $content = Get-Content $_.FullName -Raw
+                $patched = $content -replace `
+                  '#include <arpa/inet\.h>', `
+                  "#ifdef _WIN32`n#include <winsock2.h>`n#else`n#include <arpa/inet.h>`n#endif"
+                Set-Content -Path $_.FullName -Value $patched -NoNewline
+                Write-Host "Patched $($_.Name)"
+              }
+          }
 
-          # Same fix for any other picotls source that pulls in arpa/inet.h
-          find "$BUILD_DIR/_deps/picotls-src" -name "*.c" -o -name "*.h" 2>/dev/null | \
-            xargs grep -l "arpa/inet.h" | while read f; do
-              sed -i 's|#include <arpa/inet.h>|#ifdef _WIN32\n#include <winsock2.h>\n#else\n#include <arpa/inet.h>\n#endif|g' "$f"
-            done
+          # Pass 2: full configure + build
+          cmake @CmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # ── Full configure + build ────────────────────────────────────────
-          cmake "${CMAKE_ARGS[@]}"
-          cmake --build "$BUILD_DIR" --config Release \
+          cmake --build $BuildDir --config Release `
             --target picoquic-core picotls-core picotls-fusion picotls-minicrypto picotls-openssl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # ── Expose .lib files as lib<name>.a so build.rs find_lib_variant() ─
-          # build.rs looks for libpicoquic-core.a / libpicotls-core.a etc.
-          RELEASE_DIR="$BUILD_DIR/Release"
-          PTLS_RELEASE="$BUILD_DIR/_deps/picotls-build/Release"
-          mkdir -p "$RELEASE_DIR"
-          for lib in picoquic-core; do
-            [ -f "$RELEASE_DIR/${lib}.lib" ] && cp "$RELEASE_DIR/${lib}.lib" "$RELEASE_DIR/lib${lib}.a"
-          done
-          for lib in picotls-core picotls-fusion picotls-minicrypto picotls-openssl; do
-            [ -f "$PTLS_RELEASE/${lib}.lib" ] && cp "$PTLS_RELEASE/${lib}.lib" "$RELEASE_DIR/lib${lib}.a"
-          done
+          # Expose .lib files as lib<name>.a so build.rs find_lib_variant()
+          # can locate them (it probes for libpicoquic-core.a etc.)
+          $ReleaseDir  = "$BuildDir\Release"
+          $PtlsRelease = "$BuildDir\_deps\picotls-build\Release"
+          New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
-          echo "PICOQUIC_BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
-          echo "PICOQUIC_LIB_DIR=$RELEASE_DIR" >> $GITHUB_ENV
+          foreach ($lib in @("picoquic-core")) {
+            $src = "$ReleaseDir\${lib}.lib"
+            if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
+          }
+          foreach ($lib in @("picotls-core","picotls-fusion","picotls-minicrypto","picotls-openssl")) {
+            $src = "$PtlsRelease\${lib}.lib"
+            if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
+          }
 
-      # Patch build.rs so it works on Windows MSVC:
-      #   1. Link ws2_32 instead of pthread (MSVC has no libpthread).
-      #   2. Use libssl / libcrypto naming (Windows DLL import lib names).
-      - name: Patch build.rs for Windows (Windows)
+          "PICOQUIC_BUILD_DIR=$BuildDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PICOQUIC_LIB_DIR=$ReleaseDir"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Patch build.rs: MSVC has no libpthread; link ws2_32/bcrypt/ntdll instead.
+      - name: Patch build.rs for Windows
         if: runner.os == 'Windows'
-        shell: bash
+        shell: pwsh
         run: |
-          BUILD_RS="crates/slipstream-ffi/build.rs"
+          $file = "crates\slipstream-ffi\build.rs"
+          $src  = Get-Content $file -Raw
 
-          # Add is_windows flag right after `let target = ...`
-          sed -i 's/let target = env::var("TARGET").unwrap_or_default();/let target = env::var("TARGET").unwrap_or_default();\n    let is_windows = target.contains("windows");/' "$BUILD_RS"
+          # Inject `let is_windows` right after `let target = ...`
+          $src = $src -replace `
+            '(let target = env::var\("TARGET"\)\.unwrap_or_default\(\);)', `
+            "`$1`n    let is_windows = target.contains(`"windows`");"
 
-          # Replace unconditional pthread link with platform-aware version
-          sed -i 's/println!("cargo:rustc-link-lib=dylib=pthread");/if is_windows {\n        println!("cargo:rustc-link-lib=dylib=ws2_32");\n        println!("cargo:rustc-link-lib=dylib=bcrypt");\n        println!("cargo:rustc-link-lib=dylib=ntdll");\n    } else {\n        println!("cargo:rustc-link-lib=dylib=pthread");\n    }/' "$BUILD_RS"
+          # Replace unconditional pthread with a platform branch
+          $src = $src -replace `
+            'println!\("cargo:rustc-link-lib=dylib=pthread"\);', `
+            'if is_windows {
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+        println!("cargo:rustc-link-lib=dylib=bcrypt");
+        println!("cargo:rustc-link-lib=dylib=ntdll");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=pthread");
+    }'
+
+          Set-Content $file -Value $src -NoNewline
 
       # ════════════════════════════════════════════════════════════════════════
       # RUST TOOLCHAIN (shared)
@@ -169,8 +188,6 @@ jobs:
       # ════════════════════════════════════════════════════════════════════════
       # BUILD BINARIES
       # ════════════════════════════════════════════════════════════════════════
-
-      # Linux: system OpenSSL, picoquic pre-built above.
       - name: Build binaries (Linux)
         if: runner.os == 'Linux'
         env:
@@ -178,10 +195,9 @@ jobs:
         run: |
           cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }}
 
-      # Windows: openssl-vendored bundles OpenSSL into the .exe so it runs
-      # on any Windows machine without a separate OpenSSL install.
-      # PICOQUIC_AUTO_BUILD=0 skips build.rs trying to exec build_picoquic.sh
-      # (a bash script is not a valid Win32 executable → OS error 193).
+      # PICOQUIC_AUTO_BUILD=0: prevents build.rs from executing build_picoquic.sh
+      # as a Win32 process (a .sh file is not a valid Win32 executable → error 193).
+      # openssl-vendored: bundles OpenSSL into the .exe for a self-contained binary.
       - name: Build binaries (Windows)
         if: runner.os == 'Windows'
         env:
