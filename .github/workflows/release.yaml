@@ -25,19 +25,34 @@ jobs:
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: slipstream-linux-amd64
-            # Use system OpenSSL — smaller binary, no vendoring needed on Linux.
             cargo_features: ""
             client_bin: slipstream-client
             server_bin: slipstream-server
 
           # ── Windows x86_64 ───────────────────────────────────────────────
+          # Uses MinGW (x86_64-pc-windows-gnu) via MSYS2 rather than MSVC.
+          #
+          # Why not MSVC (x86_64-pc-windows-msvc)?
+          #   build.rs auto-builds picoquic by executing scripts/build_picoquic.sh.
+          #   On Windows, Command::new("...build_picoquic.sh") fails with OS error
+          #   193 "not a valid Win32 application" because .sh files are not native
+          #   Win32 executables. The fix is to pre-build picoquic using MSYS2 bash
+          #   BEFORE cargo runs, then set PICOQUIC_AUTO_BUILD=0 to skip the shell
+          #   call in build.rs.
+          #
+          # Why not openssl-vendored on Windows?
+          #   openssl-vendored vendors OpenSSL for Rust, but picoquic also needs
+          #   OpenSSL at cmake time (a separate build). It is simpler and faster
+          #   to install one copy of OpenSSL via MSYS2 and share it between both.
+          #
+          # Why MinGW instead of MSVC?
+          #   build.rs unconditionally links -lpthread (except on Android).
+          #   MinGW/MSYS2 ships libpthread natively; MSVC does not.
           - name: windows-amd64
             runner: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-gnu
             artifact_name: slipstream-windows-amd64
-            # openssl-vendored: bundles OpenSSL into the binary so the .exe
-            # runs on any Windows machine without extra runtime dependencies.
-            cargo_features: "--features openssl-vendored"
+            cargo_features: ""
             client_bin: slipstream-client.exe
             server_bin: slipstream-server.exe
 
@@ -48,21 +63,41 @@ jobs:
         with:
           submodules: recursive
 
-      # ── Per-platform build dependencies ────────────────────────────────────
+      # ── Linux: system build dependencies ───────────────────────────────────
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev python3 ninja-build
 
-      - name: Install build dependencies (Windows)
+      # ── Windows: MSYS2 / MinGW64 environment ───────────────────────────────
+      # Provides: bash, cmake, ninja, gcc, OpenSSL, pkg-config, python3.
+      # Everything picoquic needs to build is available in this one step.
+      - name: Set up MSYS2 (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # cmake and ninja are pre-installed on windows-latest runners.
-          # NASM is required by the vendored OpenSSL build.
-          choco install nasm --no-progress -y
-          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkg-config
+            python3
+
+      # Pre-build picoquic using MSYS2 bash. This must happen before `cargo
+      # build` so that build.rs finds the already-compiled libs and skips
+      # the auto-build (which would fail trying to execute the .sh script
+      # as a native Win32 process).
+      - name: Pre-build picoquic (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          PICOQUIC_BUILD_DIR: .picoquic-build
+          OPENSSL_ROOT_DIR: /mingw64
+        run: bash scripts/build_picoquic.sh
 
       # ── Rust toolchain ─────────────────────────────────────────────────────
       - name: Set up Rust
@@ -83,22 +118,40 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      # ── Build ───────────────────────────────────────────────────────────────
-      - name: Build slipstream-client
-        run: >
-          cargo build
-          -p slipstream-client
-          --release
-          --target ${{ matrix.target }}
-          ${{ matrix.cargo_features }}
+      # ── Build (Linux) ───────────────────────────────────────────────────────
+      - name: Build slipstream-client (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build -p slipstream-client --release --target ${{ matrix.target }}
 
-      - name: Build slipstream-server
-        run: >
-          cargo build
-          -p slipstream-server
-          --release
-          --target ${{ matrix.target }}
-          ${{ matrix.cargo_features }}
+      - name: Build slipstream-server (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build -p slipstream-server --release --target ${{ matrix.target }}
+
+      # ── Build (Windows) ─────────────────────────────────────────────────────
+      # Run cargo inside MSYS2 so that:
+      #   - MinGW gcc/g++ are on PATH for the `cc` crate to compile C files.
+      #   - pkg-config can locate the MSYS2 OpenSSL for openssl-sys.
+      #   - PICOQUIC_AUTO_BUILD=0 prevents build.rs from re-running build_picoquic.sh.
+      #   - PICOQUIC_BUILD_DIR points to the libs we pre-built above.
+      - name: Build slipstream-client (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          PICOQUIC_AUTO_BUILD: "0"
+          PICOQUIC_BUILD_DIR: .picoquic-build
+          OPENSSL_ROOT_DIR: /mingw64
+          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
+        run: cargo build -p slipstream-client --release --target ${{ matrix.target }}
+
+      - name: Build slipstream-server (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          PICOQUIC_AUTO_BUILD: "0"
+          PICOQUIC_BUILD_DIR: .picoquic-build
+          OPENSSL_ROOT_DIR: /mingw64
+          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
+        run: cargo build -p slipstream-server --release --target ${{ matrix.target }}
 
       # ── Package ─────────────────────────────────────────────────────────────
       - name: Package binaries (Linux)
