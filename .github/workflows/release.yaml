@@ -11,50 +11,27 @@ jobs:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    permissions:
+      contents: write
 
     strategy:
       fail-fast: false
       matrix:
         include:
           # ── Linux x86_64 ──────────────────────────────────────────────────
-          # Build on ubuntu-22.04 (glibc 2.35) so the binary runs on
-          # Ubuntu 22.04 and any newer Ubuntu / Debian-family release.
-          # Building on a newer runner would produce a binary that requires
-          # a newer glibc and would fail to start on 22.04.
+          # ubuntu-22.04 = glibc 2.35 → binary runs on 22.04 and any newer release.
           - name: linux-amd64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: slipstream-linux-amd64
-            cargo_features: ""
-            client_bin: slipstream-client
-            server_bin: slipstream-server
+            exe_ext: ""
 
           # ── Windows x86_64 ───────────────────────────────────────────────
-          # Uses MinGW (x86_64-pc-windows-gnu) via MSYS2 rather than MSVC.
-          #
-          # Why not MSVC (x86_64-pc-windows-msvc)?
-          #   build.rs auto-builds picoquic by executing scripts/build_picoquic.sh.
-          #   On Windows, Command::new("...build_picoquic.sh") fails with OS error
-          #   193 "not a valid Win32 application" because .sh files are not native
-          #   Win32 executables. The fix is to pre-build picoquic using MSYS2 bash
-          #   BEFORE cargo runs, then set PICOQUIC_AUTO_BUILD=0 to skip the shell
-          #   call in build.rs.
-          #
-          # Why not openssl-vendored on Windows?
-          #   openssl-vendored vendors OpenSSL for Rust, but picoquic also needs
-          #   OpenSSL at cmake time (a separate build). It is simpler and faster
-          #   to install one copy of OpenSSL via MSYS2 and share it between both.
-          #
-          # Why MinGW instead of MSVC?
-          #   build.rs unconditionally links -lpthread (except on Android).
-          #   MinGW/MSYS2 ships libpthread natively; MSVC does not.
           - name: windows-amd64
             runner: windows-latest
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
             artifact_name: slipstream-windows-amd64
-            cargo_features: ""
-            client_bin: slipstream-client.exe
-            server_bin: slipstream-server.exe
+            exe_ext: ".exe"
 
     steps:
       # ── Source ─────────────────────────────────────────────────────────────
@@ -63,49 +40,120 @@ jobs:
         with:
           submodules: recursive
 
-      # ── Linux: system build dependencies ───────────────────────────────────
+      # ════════════════════════════════════════════════════════════════════════
+      # LINUX
+      # ════════════════════════════════════════════════════════════════════════
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev python3 ninja-build
 
-      # ── Windows: MSYS2 / MinGW64 environment ───────────────────────────────
-      # Provides: bash, cmake, ninja, gcc, OpenSSL, pkg-config, python3.
-      # Everything picoquic needs to build is available in this one step.
-      - name: Set up MSYS2 (Windows)
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-pkg-config
-            python3
+      - name: Build picoquic (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/build_picoquic.sh
+          echo "PICOQUIC_BUILD_DIR=${{ github.workspace }}/.picoquic-build" >> $GITHUB_ENV
 
-      # Pre-build picoquic using MSYS2 bash. This must happen before `cargo
-      # build` so that build.rs finds the already-compiled libs and skips
-      # the auto-build (which would fail trying to execute the .sh script
-      # as a native Win32 process).
-      - name: Pre-build picoquic (Windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        env:
-          PICOQUIC_BUILD_DIR: .picoquic-build
-          OPENSSL_ROOT_DIR: /mingw64
-        run: bash scripts/build_picoquic.sh
+      # ════════════════════════════════════════════════════════════════════════
+      # WINDOWS
+      # ════════════════════════════════════════════════════════════════════════
 
-      # ── Rust toolchain ─────────────────────────────────────────────────────
+      # cmake + ninja are pre-installed. strawberryperl gives us a Perl that
+      # openssl-src needs to configure OpenSSL. pkgconfiglite provides pkg-config.
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install pkgconfiglite strawberryperl --no-progress -y
+          # Expose Strawberry Perl on PATH so openssl-src can find it
+          $perl = "C:\Strawberry\perl\bin"
+          if (Test-Path $perl) {
+            echo "$perl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      # Build picoquic with MSVC (Visual Studio 17 2022).
+      # Git Bash is available on all windows-latest runners — use it to run
+      # the bash script without needing MSYS2.
+      - name: Build picoquic (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          PICOQUIC_DIR="${GITHUB_WORKSPACE}/vendor/picoquic"
+          BUILD_DIR="${GITHUB_WORKSPACE}/.picoquic-build"
+
+          CMAKE_ARGS=(
+            -S "$PICOQUIC_DIR"
+            -B "$BUILD_DIR"
+            -G "Visual Studio 17 2022" -A x64
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DPICOQUIC_FETCH_PTLS=ON
+            -DBUILD_TESTING=OFF
+            -Dpicoquic_BUILD_TESTS=OFF
+            -Wno-dev
+          )
+
+          # First cmake run fetches picotls via FetchContent
+          cmake "${CMAKE_ARGS[@]}" || true
+
+          # ── Patch picotls: arpa/inet.h does not exist on Windows ──────────
+          # picotls/lib/picotls.c includes <arpa/inet.h> which is POSIX-only.
+          # Replace it with <winsock2.h> inside a WIN32 guard.
+          PTLS_C="$BUILD_DIR/_deps/picotls-src/lib/picotls.c"
+          if [ -f "$PTLS_C" ]; then
+            sed -i 's|#include <arpa/inet.h>|#ifdef _WIN32\n#include <winsock2.h>\n#else\n#include <arpa/inet.h>\n#endif|g' "$PTLS_C"
+          fi
+
+          # Same fix for any other picotls source that pulls in arpa/inet.h
+          find "$BUILD_DIR/_deps/picotls-src" -name "*.c" -o -name "*.h" 2>/dev/null | \
+            xargs grep -l "arpa/inet.h" | while read f; do
+              sed -i 's|#include <arpa/inet.h>|#ifdef _WIN32\n#include <winsock2.h>\n#else\n#include <arpa/inet.h>\n#endif|g' "$f"
+            done
+
+          # ── Full configure + build ────────────────────────────────────────
+          cmake "${CMAKE_ARGS[@]}"
+          cmake --build "$BUILD_DIR" --config Release \
+            --target picoquic-core picotls-core picotls-fusion picotls-minicrypto picotls-openssl
+
+          # ── Expose .lib files as lib<name>.a so build.rs find_lib_variant() ─
+          # build.rs looks for libpicoquic-core.a / libpicotls-core.a etc.
+          RELEASE_DIR="$BUILD_DIR/Release"
+          PTLS_RELEASE="$BUILD_DIR/_deps/picotls-build/Release"
+          mkdir -p "$RELEASE_DIR"
+          for lib in picoquic-core; do
+            [ -f "$RELEASE_DIR/${lib}.lib" ] && cp "$RELEASE_DIR/${lib}.lib" "$RELEASE_DIR/lib${lib}.a"
+          done
+          for lib in picotls-core picotls-fusion picotls-minicrypto picotls-openssl; do
+            [ -f "$PTLS_RELEASE/${lib}.lib" ] && cp "$PTLS_RELEASE/${lib}.lib" "$RELEASE_DIR/lib${lib}.a"
+          done
+
+          echo "PICOQUIC_BUILD_DIR=$BUILD_DIR" >> $GITHUB_ENV
+          echo "PICOQUIC_LIB_DIR=$RELEASE_DIR" >> $GITHUB_ENV
+
+      # Patch build.rs so it works on Windows MSVC:
+      #   1. Link ws2_32 instead of pthread (MSVC has no libpthread).
+      #   2. Use libssl / libcrypto naming (Windows DLL import lib names).
+      - name: Patch build.rs for Windows (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BUILD_RS="crates/slipstream-ffi/build.rs"
+
+          # Add is_windows flag right after `let target = ...`
+          sed -i 's/let target = env::var("TARGET").unwrap_or_default();/let target = env::var("TARGET").unwrap_or_default();\n    let is_windows = target.contains("windows");/' "$BUILD_RS"
+
+          # Replace unconditional pthread link with platform-aware version
+          sed -i 's/println!("cargo:rustc-link-lib=dylib=pthread");/if is_windows {\n        println!("cargo:rustc-link-lib=dylib=ws2_32");\n        println!("cargo:rustc-link-lib=dylib=bcrypt");\n        println!("cargo:rustc-link-lib=dylib=ntdll");\n    } else {\n        println!("cargo:rustc-link-lib=dylib=pthread");\n    }/' "$BUILD_RS"
+
+      # ════════════════════════════════════════════════════════════════════════
+      # RUST TOOLCHAIN (shared)
+      # ════════════════════════════════════════════════════════════════════════
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # Cache Cargo registry + compiled deps to speed up repeat builds.
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -118,65 +166,53 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      # ── Build (Linux) ───────────────────────────────────────────────────────
-      - name: Build slipstream-client (Linux)
-        if: runner.os == 'Linux'
-        run: cargo build -p slipstream-client --release --target ${{ matrix.target }}
+      # ════════════════════════════════════════════════════════════════════════
+      # BUILD BINARIES
+      # ════════════════════════════════════════════════════════════════════════
 
-      - name: Build slipstream-server (Linux)
+      # Linux: system OpenSSL, picoquic pre-built above.
+      - name: Build binaries (Linux)
         if: runner.os == 'Linux'
-        run: cargo build -p slipstream-server --release --target ${{ matrix.target }}
-
-      # ── Build (Windows) ─────────────────────────────────────────────────────
-      # Run cargo inside MSYS2 so that:
-      #   - MinGW gcc/g++ are on PATH for the `cc` crate to compile C files.
-      #   - pkg-config can locate the MSYS2 OpenSSL for openssl-sys.
-      #   - PICOQUIC_AUTO_BUILD=0 prevents build.rs from re-running build_picoquic.sh.
-      #   - PICOQUIC_BUILD_DIR points to the libs we pre-built above.
-      - name: Build slipstream-client (Windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
         env:
           PICOQUIC_AUTO_BUILD: "0"
-          PICOQUIC_BUILD_DIR: .picoquic-build
-          OPENSSL_ROOT_DIR: /mingw64
-          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
-        run: cargo build -p slipstream-client --release --target ${{ matrix.target }}
+        run: |
+          cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }}
 
-      - name: Build slipstream-server (Windows)
+      # Windows: openssl-vendored bundles OpenSSL into the .exe so it runs
+      # on any Windows machine without a separate OpenSSL install.
+      # PICOQUIC_AUTO_BUILD=0 skips build.rs trying to exec build_picoquic.sh
+      # (a bash script is not a valid Win32 executable → OS error 193).
+      - name: Build binaries (Windows)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
         env:
           PICOQUIC_AUTO_BUILD: "0"
-          PICOQUIC_BUILD_DIR: .picoquic-build
-          OPENSSL_ROOT_DIR: /mingw64
-          PKG_CONFIG_PATH: /mingw64/lib/pkgconfig
-        run: cargo build -p slipstream-server --release --target ${{ matrix.target }}
+        run: |
+          cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }} --features openssl-vendored
 
-      # ── Package ─────────────────────────────────────────────────────────────
+      # ════════════════════════════════════════════════════════════════════════
+      # PACKAGE
+      # ════════════════════════════════════════════════════════════════════════
       - name: Package binaries (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          BIN_DIR="target/${{ matrix.target }}/release"
-          DIST="dist"
-          mkdir -p "${DIST}"
-          cp "${BIN_DIR}/slipstream-client" "${DIST}/"
-          cp "${BIN_DIR}/slipstream-server" "${DIST}/"
-          cd "${DIST}"
-          sha256sum slipstream-client slipstream-server \
-            > "${{ matrix.artifact_name }}.sha256"
-          cat "${{ matrix.artifact_name }}.sha256"
+          BIN="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          cp "$BIN/slipstream-client" dist/
+          cp "$BIN/slipstream-server" dist/
+          cd dist
+          sha256sum slipstream-client slipstream-server > ${{ matrix.artifact_name }}.sha256
+          cat ${{ matrix.artifact_name }}.sha256
 
       - name: Package binaries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $BinDir = "target\${{ matrix.target }}\release"
-          $Dist   = "dist"
+          $Bin  = "target\${{ matrix.target }}\release"
+          $Dist = "dist"
           New-Item -ItemType Directory -Force -Path $Dist | Out-Null
-          Copy-Item "$BinDir\slipstream-client.exe" $Dist
-          Copy-Item "$BinDir\slipstream-server.exe" $Dist
+          Copy-Item "$Bin\slipstream-client.exe" $Dist
+          Copy-Item "$Bin\slipstream-server.exe" $Dist
           Push-Location $Dist
           $hash = Get-FileHash "slipstream-client.exe","slipstream-server.exe" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" }
@@ -184,7 +220,6 @@ jobs:
           Get-Content "${{ matrix.artifact_name }}.sha256"
           Pop-Location
 
-      # ── Upload artifact ─────────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -192,7 +227,7 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # ── Attach artifacts to the GitHub Release (tag pushes only) ───────────────
+  # ── GitHub Release (tag pushes only) ───────────────────────────────────────
   release:
     name: Publish GitHub Release
     needs: build
@@ -206,9 +241,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-
-      - name: Display downloaded files
-        run: find artifacts/ -type f | sort
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
