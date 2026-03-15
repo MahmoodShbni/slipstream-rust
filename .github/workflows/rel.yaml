@@ -15,6 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ubuntu-22.04 = glibc 2.35 → binary runs on 22.04 and any newer release.
           - name: linux-amd64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -33,9 +34,9 @@ jobs:
         with:
           submodules: recursive
 
-      # =========================
+      # ════════════════════════════════════════════════════════════════════════
       # LINUX
-      # =========================
+      # ════════════════════════════════════════════════════════════════════════
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -48,9 +49,15 @@ jobs:
           bash scripts/build_picoquic.sh
           echo "PICOQUIC_BUILD_DIR=${{ github.workspace }}/.picoquic-build" >> $GITHUB_ENV
 
-      # =========================
+      # ════════════════════════════════════════════════════════════════════════
       # WINDOWS
-      # =========================
+      #
+      # All Windows steps use shell: pwsh (PowerShell) — NOT Git Bash.
+      # Git Bash mangles Windows paths when they pass through find|xargs|grep,
+      # stripping drive-letter slashes (D:/a/... → D:a...) which makes grep
+      # report "No such file or directory" and exit 123. PowerShell uses
+      # native Windows paths throughout and has no such conversion issue.
+      # ════════════════════════════════════════════════════════════════════════
       - name: Install build dependencies (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -61,6 +68,12 @@ jobs:
             "$perl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
 
+      # Build picoquic with MSVC. Two-pass cmake:
+      #   Pass 1 – configure only (may fail), which triggers FetchContent to
+      #            download picotls into .picoquic-build/_deps/picotls-src.
+      #   Patch  – replace #include <arpa/inet.h> (POSIX-only, absent on MSVC)
+      #            with a _WIN32-guarded <winsock2.h> in every picotls file.
+      #   Pass 2 – full configure + build.
       - name: Build picoquic (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -79,69 +92,82 @@ jobs:
             "-Wno-dev"
           )
 
-          # Pass 1: fetch picotls
+          # Pass 1: fetch picotls (ignore cmake exit code)
           cmake @CmakeArgs; $true
 
+          # Patch every picotls .c/.h that includes arpa/inet.h
           $ptlsSrc = "$BuildDir\_deps\picotls-src"
-
           if (Test-Path $ptlsSrc) {
-
-            Write-Host "picotls source found"
-
-            # Create shim header for MSVC
-            $shim = "$ptlsSrc\include\wincompat.h"
-
-            if (!(Test-Path $shim)) {
-              New-Item -ItemType File -Force -Path $shim | Out-Null
-              Set-Content $shim '#include "picotls/wincompat.h"'
-              Write-Host "Created wincompat shim"
-            }
-
-            # Fix wincompat includes
-            Get-ChildItem $ptlsSrc -Recurse -Include "*.c","*.h" |
-            ForEach-Object {
-              $c = Get-Content $_.FullName -Raw
-              $p = $c -replace '(["<])wincompat\.h([">])', '"picotls/wincompat.h"'
-              if ($p -ne $c) {
-                Set-Content $_.FullName $p -NoNewline
-                Write-Host "Patched wincompat include in $($_.Name)"
-              }
-            }
-
-            # Fix arpa/inet.h for Windows
-            Get-ChildItem $ptlsSrc -Recurse -Include "*.c","*.h" |
+            Get-ChildItem -Path $ptlsSrc -Recurse -Include "*.c","*.h" |
               Where-Object { Select-String -Path $_.FullName -Pattern "arpa/inet\.h" -Quiet } |
               ForEach-Object {
-
                 $content = Get-Content $_.FullName -Raw
                 $patched = $content -replace `
                   '#include <arpa/inet\.h>', `
                   "#ifdef _WIN32`n#include <winsock2.h>`n#else`n#include <arpa/inet.h>`n#endif"
-
-                Set-Content $_.FullName $patched -NoNewline
+                Set-Content -Path $_.FullName -Value $patched -NoNewline
                 Write-Host "Patched $($_.Name)"
               }
           }
 
-          # Pass 2
+          # Patch picoquic_packet_loop.h: add ssize_t typedef for MSVC.
+          # ssize_t is a POSIX type; MSVC doesn't define it. Every other error
+          # in sockloop.c (C2061, C2143, C2223 etc.) is a cascade from this.
+          # Build the guard as a concatenated string to keep the YAML block
+          # scalar valid (lines starting at column 1 break YAML parsing).
+          $pqHeader = "$env:GITHUB_WORKSPACE\vendor\picoquic\picoquic\picoquic_packet_loop.h"
+          if (Test-Path $pqHeader) {
+            $hContent = Get-Content $pqHeader -Raw
+            if ($hContent -notmatch 'SSIZE_T ssize_t') {
+              $nl = "`n"
+              $guard  = '#ifdef _WIN32'
+              $guard += $nl + '#ifndef _SSIZE_T_DEFINED'
+              $guard += $nl + '#define _SSIZE_T_DEFINED'
+              $guard += $nl + '#include <BaseTsd.h>'
+              $guard += $nl + 'typedef SSIZE_T ssize_t;'
+              $guard += $nl + '#endif'
+              $guard += $nl + '#endif' + $nl
+              $hContent = $guard + $hContent
+              Set-Content $pqHeader -Value $hContent -NoNewline
+              Write-Host "Patched picoquic_packet_loop.h with ssize_t"
+            }
+          }
+
+          # Copy wincompat.h into the include path.
+          # picotls.h and several .c files do #include "wincompat.h" but the
+          # file lives under picotlsvs/picotls/ and is not on the compiler's
+          # include path by default. Copying it to include/ fixes C1083.
+          $wincompat = Get-ChildItem -Path $ptlsSrc -Recurse -Filter "wincompat.h" |
+            Select-Object -First 1
+          if ($wincompat) {
+            $dst = "$ptlsSrc\include"
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Copy-Item $wincompat.FullName "$dst\wincompat.h" -Force
+            # Also drop it next to each .c file that references it
+            Copy-Item $wincompat.FullName "$ptlsSrc\lib\wincompat.h" -Force
+            Write-Host "Copied wincompat.h to include/ and lib/"
+          } else {
+            Write-Host "WARNING: wincompat.h not found in picotls source tree"
+          }
+
+          # Pass 2: full configure + build
           cmake @CmakeArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           cmake --build $BuildDir --config Release `
             --target picoquic-core picotls-core picotls-fusion picotls-minicrypto picotls-openssl
-
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          # Expose .lib files as lib<name>.a so build.rs find_lib_variant()
+          # can locate them (it probes for libpicoquic-core.a etc.)
           $ReleaseDir  = "$BuildDir\Release"
           $PtlsRelease = "$BuildDir\_deps\picotls-build\Release"
-
           New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
           foreach ($lib in @("picoquic-core")) {
             $src = "$ReleaseDir\${lib}.lib"
             if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
           }
-
           foreach ($lib in @("picotls-core","picotls-fusion","picotls-minicrypto","picotls-openssl")) {
             $src = "$PtlsRelease\${lib}.lib"
             if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
@@ -150,6 +176,7 @@ jobs:
           "PICOQUIC_BUILD_DIR=$BuildDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PICOQUIC_LIB_DIR=$ReleaseDir"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # Patch build.rs: MSVC has no libpthread; link ws2_32/bcrypt/ntdll instead.
       - name: Patch build.rs for Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -157,10 +184,13 @@ jobs:
           $file = "crates\slipstream-ffi\build.rs"
           $src  = Get-Content $file -Raw
 
+          # Inject `let is_windows` right after `let target = ...`
           $src = $src -replace `
             '(let target = env::var\("TARGET"\)\.unwrap_or_default\(\);)', `
             "`$1`n    let is_windows = target.contains(`"windows`");"
 
+          # Build the replacement as a concatenated string to avoid embedding
+          # literal newlines in the YAML block scalar (causes YAML parse errors).
           $nl = "`n"
           $r  = '    if is_windows {'
           $r += $nl + '        println!("cargo:rustc-link-lib=dylib=ws2_32");'
@@ -176,6 +206,9 @@ jobs:
 
           Set-Content $file -Value $src -NoNewline
 
+      # ════════════════════════════════════════════════════════════════════════
+      # RUST TOOLCHAIN (shared)
+      # ════════════════════════════════════════════════════════════════════════
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -190,7 +223,12 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
 
+      # ════════════════════════════════════════════════════════════════════════
+      # BUILD BINARIES
+      # ════════════════════════════════════════════════════════════════════════
       - name: Build binaries (Linux)
         if: runner.os == 'Linux'
         env:
@@ -198,6 +236,9 @@ jobs:
         run: |
           cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }}
 
+      # PICOQUIC_AUTO_BUILD=0: prevents build.rs from executing build_picoquic.sh
+      # as a Win32 process (a .sh file is not a valid Win32 executable → error 193).
+      # openssl-vendored: bundles OpenSSL into the .exe for a self-contained binary.
       - name: Build binaries (Windows)
         if: runner.os == 'Windows'
         env:
@@ -205,15 +246,20 @@ jobs:
         run: |
           cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }} --features openssl-vendored
 
+      # ════════════════════════════════════════════════════════════════════════
+      # PACKAGE
+      # ════════════════════════════════════════════════════════════════════════
       - name: Package binaries (Linux)
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           BIN="target/${{ matrix.target }}/release"
           mkdir -p dist
           cp "$BIN/slipstream-client" dist/
           cp "$BIN/slipstream-server" dist/
           cd dist
           sha256sum slipstream-client slipstream-server > ${{ matrix.artifact_name }}.sha256
+          cat ${{ matrix.artifact_name }}.sha256
 
       - name: Package binaries (Windows)
         if: runner.os == 'Windows'
@@ -221,16 +267,14 @@ jobs:
         run: |
           $Bin  = "target\${{ matrix.target }}\release"
           $Dist = "dist"
-
           New-Item -ItemType Directory -Force -Path $Dist | Out-Null
           Copy-Item "$Bin\slipstream-client.exe" $Dist
           Copy-Item "$Bin\slipstream-server.exe" $Dist
-
           Push-Location $Dist
           $hash = Get-FileHash "slipstream-client.exe","slipstream-server.exe" -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" }
-
           $hash | Set-Content "${{ matrix.artifact_name }}.sha256"
+          Get-Content "${{ matrix.artifact_name }}.sha256"
           Pop-Location
 
       - name: Upload artifact
