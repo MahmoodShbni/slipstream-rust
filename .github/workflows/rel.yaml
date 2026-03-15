@@ -110,6 +110,23 @@ jobs:
               }
           }
 
+          # Copy wincompat.h into the include path.
+          # picotls.h and several .c files do #include "wincompat.h" but the
+          # file lives under picotlsvs/picotls/ and is not on the compiler's
+          # include path by default. Copying it to include/ fixes C1083.
+          $wincompat = Get-ChildItem -Path $ptlsSrc -Recurse -Filter "wincompat.h" |
+            Select-Object -First 1
+          if ($wincompat) {
+            $dst = "$ptlsSrc\include"
+            New-Item -ItemType Directory -Force -Path $dst | Out-Null
+            Copy-Item $wincompat.FullName "$dst\wincompat.h" -Force
+            # Also drop it next to each .c file that references it
+            Copy-Item $wincompat.FullName "$ptlsSrc\lib\wincompat.h" -Force
+            Write-Host "Copied wincompat.h to include/ and lib/"
+          } else {
+            Write-Host "WARNING: wincompat.h not found in picotls source tree"
+          }
+
           # Pass 2: full configure + build
           cmake @CmakeArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
