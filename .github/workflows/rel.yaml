@@ -149,16 +149,20 @@ jobs:
             '(let target = env::var\("TARGET"\)\.unwrap_or_default\(\);)', `
             "`$1`n    let is_windows = target.contains(`"windows`");"
 
-          # Replace unconditional pthread with a platform branch
+          # Build the replacement as a concatenated string to avoid embedding
+          # literal newlines in the YAML block scalar (causes YAML parse errors).
+          $nl = "`n"
+          $r  = '    if is_windows {'
+          $r += $nl + '        println!("cargo:rustc-link-lib=dylib=ws2_32");'
+          $r += $nl + '        println!("cargo:rustc-link-lib=dylib=bcrypt");'
+          $r += $nl + '        println!("cargo:rustc-link-lib=dylib=ntdll");'
+          $r += $nl + '    } else {'
+          $r += $nl + '        println!("cargo:rustc-link-lib=dylib=pthread");'
+          $r += $nl + '    }'
+
           $src = $src -replace `
-            'println!\("cargo:rustc-link-lib=dylib=pthread"\);', `
-            'if is_windows {
-        println!("cargo:rustc-link-lib=dylib=ws2_32");
-        println!("cargo:rustc-link-lib=dylib=bcrypt");
-        println!("cargo:rustc-link-lib=dylib=ntdll");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=pthread");
-    }'
+            '    println!\("cargo:rustc-link-lib=dylib=pthread"\);', `
+            $r
 
           Set-Content $file -Value $src -NoNewline
 
