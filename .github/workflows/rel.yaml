@@ -1,0 +1,241 @@
+name: Build now
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 = glibc 2.35 → binary runs on 22.04 and any newer release.
+          - name: linux-amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: slipstream-linux-amd64
+            exe_ext: ""
+
+          - name: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: slipstream-windows-amd64
+            exe_ext: ".exe"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ════════════════════════════════════════════════════════════════════════
+      # LINUX
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev python3 ninja-build
+
+      - name: Build picoquic (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash scripts/build_picoquic.sh
+          echo "PICOQUIC_BUILD_DIR=${{ github.workspace }}/.picoquic-build" >> $GITHUB_ENV
+
+      # ════════════════════════════════════════════════════════════════════════
+      # WINDOWS
+      #
+      # All Windows steps use shell: pwsh (PowerShell) — NOT Git Bash.
+      # Git Bash mangles Windows paths when they pass through find|xargs|grep,
+      # stripping drive-letter slashes (D:/a/... → D:a...) which makes grep
+      # report "No such file or directory" and exit 123. PowerShell uses
+      # native Windows paths throughout and has no such conversion issue.
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install pkgconfiglite strawberryperl --no-progress -y
+          $perl = "C:\Strawberry\perl\bin"
+          if (Test-Path $perl) {
+            "$perl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      # Build picoquic with MSVC. Two-pass cmake:
+      #   Pass 1 – configure only (may fail), which triggers FetchContent to
+      #            download picotls into .picoquic-build/_deps/picotls-src.
+      #   Patch  – replace #include <arpa/inet.h> (POSIX-only, absent on MSVC)
+      #            with a _WIN32-guarded <winsock2.h> in every picotls file.
+      #   Pass 2 – full configure + build.
+      - name: Build picoquic (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PicoquicDir = "$env:GITHUB_WORKSPACE\vendor\picoquic"
+          $BuildDir    = "$env:GITHUB_WORKSPACE\.picoquic-build"
+
+          $CmakeArgs = @(
+            "-S", $PicoquicDir,
+            "-B", $BuildDir,
+            "-G", "Visual Studio 17 2022", "-A", "x64",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DPICOQUIC_FETCH_PTLS=ON",
+            "-DBUILD_TESTING=OFF",
+            "-Dpicoquic_BUILD_TESTS=OFF",
+            "-Wno-dev"
+          )
+
+          # Pass 1: fetch picotls (ignore cmake exit code)
+          cmake @CmakeArgs; $true
+
+          # Patch every picotls .c/.h that includes arpa/inet.h
+          $ptlsSrc = "$BuildDir\_deps\picotls-src"
+          if (Test-Path $ptlsSrc) {
+            Get-ChildItem -Path $ptlsSrc -Recurse -Include "*.c","*.h" |
+              Where-Object { Select-String -Path $_.FullName -Pattern "arpa/inet\.h" -Quiet } |
+              ForEach-Object {
+                $content = Get-Content $_.FullName -Raw
+                $patched = $content -replace `
+                  '#include <arpa/inet\.h>', `
+                  "#ifdef _WIN32`n#include <winsock2.h>`n#else`n#include <arpa/inet.h>`n#endif"
+                Set-Content -Path $_.FullName -Value $patched -NoNewline
+                Write-Host "Patched $($_.Name)"
+              }
+          }
+
+          # Pass 2: full configure + build
+          cmake @CmakeArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cmake --build $BuildDir --config Release `
+            --target picoquic-core picotls-core picotls-fusion picotls-minicrypto picotls-openssl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Expose .lib files as lib<name>.a so build.rs find_lib_variant()
+          # can locate them (it probes for libpicoquic-core.a etc.)
+          $ReleaseDir  = "$BuildDir\Release"
+          $PtlsRelease = "$BuildDir\_deps\picotls-build\Release"
+          New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
+
+          foreach ($lib in @("picoquic-core")) {
+            $src = "$ReleaseDir\${lib}.lib"
+            if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
+          }
+          foreach ($lib in @("picotls-core","picotls-fusion","picotls-minicrypto","picotls-openssl")) {
+            $src = "$PtlsRelease\${lib}.lib"
+            if (Test-Path $src) { Copy-Item $src "$ReleaseDir\lib${lib}.a" }
+          }
+
+          "PICOQUIC_BUILD_DIR=$BuildDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PICOQUIC_LIB_DIR=$ReleaseDir"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Patch build.rs: MSVC has no libpthread; link ws2_32/bcrypt/ntdll instead.
+      - name: Patch build.rs for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $file = "crates\slipstream-ffi\build.rs"
+          $src  = Get-Content $file -Raw
+
+          # Inject `let is_windows` right after `let target = ...`
+          $src = $src -replace `
+            '(let target = env::var\("TARGET"\)\.unwrap_or_default\(\);)', `
+            "`$1`n    let is_windows = target.contains(`"windows`");"
+
+          # Replace unconditional pthread with a platform branch
+          $src = $src -replace `
+            'println!\("cargo:rustc-link-lib=dylib=pthread"\);', `
+            'if is_windows {
+        println!("cargo:rustc-link-lib=dylib=ws2_32");
+        println!("cargo:rustc-link-lib=dylib=bcrypt");
+        println!("cargo:rustc-link-lib=dylib=ntdll");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=pthread");
+    }'
+
+          Set-Content $file -Value $src -NoNewline
+
+      # ════════════════════════════════════════════════════════════════════════
+      # RUST TOOLCHAIN (shared)
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      # ════════════════════════════════════════════════════════════════════════
+      # BUILD BINARIES
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Build binaries (Linux)
+        if: runner.os == 'Linux'
+        env:
+          PICOQUIC_AUTO_BUILD: "0"
+        run: |
+          cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }}
+
+      # PICOQUIC_AUTO_BUILD=0: prevents build.rs from executing build_picoquic.sh
+      # as a Win32 process (a .sh file is not a valid Win32 executable → error 193).
+      # openssl-vendored: bundles OpenSSL into the .exe for a self-contained binary.
+      - name: Build binaries (Windows)
+        if: runner.os == 'Windows'
+        env:
+          PICOQUIC_AUTO_BUILD: "0"
+        run: |
+          cargo build -p slipstream-client -p slipstream-server --release --target ${{ matrix.target }} --features openssl-vendored
+
+      # ════════════════════════════════════════════════════════════════════════
+      # PACKAGE
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Package binaries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          cp "$BIN/slipstream-client" dist/
+          cp "$BIN/slipstream-server" dist/
+          cd dist
+          sha256sum slipstream-client slipstream-server > ${{ matrix.artifact_name }}.sha256
+          cat ${{ matrix.artifact_name }}.sha256
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Bin  = "target\${{ matrix.target }}\release"
+          $Dist = "dist"
+          New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+          Copy-Item "$Bin\slipstream-client.exe" $Dist
+          Copy-Item "$Bin\slipstream-server.exe" $Dist
+          Push-Location $Dist
+          $hash = Get-FileHash "slipstream-client.exe","slipstream-server.exe" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" }
+          $hash | Set-Content "${{ matrix.artifact_name }}.sha256"
+          Get-Content "${{ matrix.artifact_name }}.sha256"
+          Pop-Location
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/
+          if-no-files-found: error
