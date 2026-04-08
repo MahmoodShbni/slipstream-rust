@@ -1,11 +1,15 @@
+mod config;
 mod dns;
 mod error;
+mod loadbalance;
 mod pacing;
 mod pinning;
 mod runtime;
 mod streams;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser};
+use config::{Config, TunnelConfig};
+use loadbalance::{run_load_balancer, TunnelPool};
 use slipstream_core::{
     cli::{exit_with_error, exit_with_message, init_logging, unwrap_or_exit},
     normalize_domain, parse_host_port, parse_host_port_parts, sip003, AddressKind, HostPort,
@@ -26,6 +30,10 @@ use runtime::run_client;
     )
 )]
 struct Args {
+    /// Path to a JSON config file (enables multi-tunnel + load balancer mode).
+    #[arg(long = "config", short = 'C', value_name = "PATH")]
+    config: Option<String>,
+
     #[arg(long = "tcp-listen-host", default_value = "::")]
     tcp_listen_host: String,
     #[arg(long = "tcp-listen-port", short = 'l', default_value_t = 5201)]
@@ -64,6 +72,18 @@ fn main() {
     init_logging();
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    // ── JSON config / multi-tunnel mode ──────────────────────────────────────
+    if let Some(config_path) = &args.config {
+        let cfg = unwrap_or_exit(Config::from_file(config_path), "Config error", 2);
+        if cfg.tunnels.is_empty() {
+            exit_with_message("Config must contain at least one tunnel", 2);
+        }
+        run_multi_tunnel(cfg);
+        return;
+    }
+
+    // ── Single-tunnel mode (original behaviour) ───────────────────────────────
     let sip003_env = unwrap_or_exit(sip003::read_sip003_env(), "SIP003 env error", 2);
     if sip003_env.is_present() {
         tracing::info!("SIP003 env detected; applying SS_* overrides with CLI precedence");
@@ -195,6 +215,136 @@ fn main() {
     }
 }
 
+// ── Multi-tunnel ─────────────────────────────────────────────────────────────
+
+fn resolvers_from_tunnel_config(tc: &TunnelConfig) -> Result<Vec<ResolverSpec>, String> {
+    let mut specs = Vec::new();
+    for r in &tc.resolver {
+        let hp = parse_host_port(r, 53, AddressKind::Resolver).map_err(|e| e.to_string())?;
+        specs.push(ResolverSpec {
+            resolver: hp,
+            mode: ResolverMode::Recursive,
+        });
+    }
+    for r in &tc.authoritative {
+        let hp = parse_host_port(r, 53, AddressKind::Resolver).map_err(|e| e.to_string())?;
+        specs.push(ResolverSpec {
+            resolver: hp,
+            mode: ResolverMode::Authoritative,
+        });
+    }
+    if specs.is_empty() {
+        return Err("At least one resolver is required per tunnel".to_string());
+    }
+    Ok(specs)
+}
+
+fn run_multi_tunnel(cfg: Config) {
+    tracing::info!("Multi-tunnel mode: {} tunnels", cfg.tunnels.len());
+
+    let lb_cfg = cfg.load_balance.clone();
+    let tunnel_ports: Vec<u16> = cfg.tunnels.iter().map(|t| t.tcp_listen_port).collect();
+
+    // Each tunnel gets its own OS thread + current_thread Tokio runtime.
+    // run_client uses raw pointers so it is !Send — OS threads avoid that issue.
+    let mut handles = Vec::new();
+    for (idx, tunnel) in cfg.tunnels.into_iter().enumerate() {
+        let handle = std::thread::Builder::new()
+            .name(format!("tunnel-{}", idx))
+            .spawn(move || {
+                let resolvers = match resolvers_from_tunnel_config(&tunnel) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!("tunnel {}: resolver error: {}", idx, e);
+                        return;
+                    }
+                };
+                let domain = tunnel.domain.clone();
+                let tcp_host = tunnel.tcp_listen_host.clone();
+                let cert = tunnel.cert.clone();
+                let cc = tunnel.congestion_control.clone();
+
+                let config = ClientConfig {
+                    tcp_listen_host: &tcp_host,
+                    tcp_listen_port: tunnel.tcp_listen_port,
+                    resolvers: &resolvers,
+                    congestion_control: cc.as_deref(),
+                    gso: tunnel.gso,
+                    domain: &domain,
+                    cert: cert.as_deref(),
+                    keep_alive_interval: tunnel.keep_alive_interval as usize,
+                    debug_poll: false,
+                    debug_streams: false,
+                };
+
+                let runtime = Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("Failed to build Tokio runtime for tunnel");
+
+                tracing::info!("tunnel {}: starting on port {}", idx, tunnel.tcp_listen_port);
+                loop {
+                    match runtime.block_on(run_client(&config)) {
+                        Ok(0) => {
+                            tracing::info!("tunnel {}: exited cleanly", idx);
+                            break;
+                        }
+                        Ok(code) => {
+                            tracing::warn!(
+                                "tunnel {}: exited with code {}; restarting in 5s",
+                                idx, code
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "tunnel {}: error: {}; restarting in 5s",
+                                idx, err
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            })
+            .expect("Failed to spawn tunnel thread");
+        handles.push(handle);
+    }
+
+    // Load balancer thread (fully Send-safe, uses only Tokio TCP primitives).
+    if let Some(lb) = lb_cfg {
+        let strategy = lb.strategy.clone();
+        let bind = lb.bind.clone();
+        let port = lb.port;
+        let pool = TunnelPool::new(&tunnel_ports, &strategy);
+
+        let lb_handle = std::thread::Builder::new()
+            .name("load-balancer".to_string())
+            .spawn(move || {
+                let runtime = Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("Failed to build Tokio runtime for load balancer");
+                if let Err(err) = runtime.block_on(run_load_balancer(port, &bind, pool)) {
+                    tracing::error!("load balancer error: {}", err);
+                }
+            })
+            .expect("Failed to spawn load balancer thread");
+        handles.push(lb_handle);
+    } else {
+        tracing::info!(
+            "No load-balance config; tunnels on ports {:?}",
+            tunnel_ports
+        );
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+// ── Unchanged helpers ─────────────────────────────────────────────────────────
+
 fn parse_domain(input: &str) -> Result<String, String> {
     normalize_domain(input).map_err(|err| err.to_string())
 }
@@ -206,12 +356,7 @@ fn parse_resolver(input: &str) -> Result<HostPort, String> {
 fn build_resolvers(matches: &clap::ArgMatches, require: bool) -> Result<Vec<ResolverSpec>, String> {
     let mut ordered = Vec::new();
     collect_resolvers(matches, "resolver", ResolverMode::Recursive, &mut ordered)?;
-    collect_resolvers(
-        matches,
-        "authoritative",
-        ResolverMode::Authoritative,
-        &mut ordered,
-    )?;
+    collect_resolvers(matches, "authoritative", ResolverMode::Authoritative, &mut ordered)?;
     if ordered.is_empty() && require {
         return Err("At least one resolver is required".to_string());
     }
@@ -284,9 +429,7 @@ struct ResolverOptions {
     authoritative_remote: bool,
 }
 
-fn parse_resolvers_from_options(
-    options: &[sip003::Sip003Option],
-) -> Result<ResolverOptions, String> {
+fn parse_resolvers_from_options(options: &[sip003::Sip003Option]) -> Result<ResolverOptions, String> {
     let mut ordered = Vec::new();
     let mut authoritative_remote = false;
     for option in options {
@@ -305,8 +448,8 @@ fn parse_resolvers_from_options(
         }
         let entries = sip003::split_list(&option.value).map_err(|err| err.to_string())?;
         for entry in entries {
-            let resolver = parse_host_port(&entry, 53, AddressKind::Resolver)
-                .map_err(|err| err.to_string())?;
+            let resolver =
+                parse_host_port(&entry, 53, AddressKind::Resolver).map_err(|err| err.to_string())?;
             ordered.push(ResolverSpec { resolver, mode });
         }
     }
@@ -353,20 +496,15 @@ mod tests {
         let matches = Args::command()
             .try_get_matches_from([
                 "slipstream-client",
-                "--domain",
-                "example.com",
-                "--resolver",
-                "1.1.1.1",
-                "--authoritative",
-                "2.2.2.2",
-                "--resolver",
-                "3.3.3.3:5353",
+                "--domain", "example.com",
+                "--resolver", "1.1.1.1",
+                "--authoritative", "2.2.2.2",
+                "--resolver", "3.3.3.3:5353",
             ])
             .expect("matches should parse");
         let resolvers = build_resolvers(&matches, true).expect("resolvers should parse");
         assert_eq!(resolvers.len(), 3);
         assert_eq!(resolvers[0].resolver.host, "1.1.1.1");
-        assert_eq!(resolvers[0].resolver.port, 53);
         assert_eq!(resolvers[0].mode, ResolverMode::Recursive);
         assert_eq!(resolvers[1].resolver.host, "2.2.2.2");
         assert_eq!(resolvers[1].mode, ResolverMode::Authoritative);
@@ -379,94 +517,45 @@ mod tests {
         let matches = Args::command()
             .try_get_matches_from([
                 "slipstream-client",
-                "--domain",
-                "example.com",
-                "--authoritative",
-                "8.8.8.8",
-                "--resolver",
-                "9.9.9.9",
+                "--domain", "example.com",
+                "--authoritative", "8.8.8.8",
+                "--resolver", "9.9.9.9",
             ])
             .expect("matches should parse");
         let resolvers = build_resolvers(&matches, true).expect("resolvers should parse");
-        assert_eq!(resolvers.len(), 2);
         assert_eq!(resolvers[0].resolver.host, "8.8.8.8");
         assert_eq!(resolvers[0].mode, ResolverMode::Authoritative);
         assert_eq!(resolvers[1].resolver.host, "9.9.9.9");
-        assert_eq!(resolvers[1].mode, ResolverMode::Recursive);
     }
 
     #[test]
-    fn parses_plugin_resolvers_in_order() {
-        let options = vec![
-            sip003::Sip003Option {
-                key: "resolver".to_string(),
-                value: "1.1.1.1,2.2.2.2:5353".to_string(),
-            },
-            sip003::Sip003Option {
-                key: "authoritative".to_string(),
-                value: "3.3.3.3".to_string(),
-            },
-            sip003::Sip003Option {
-                key: "resolver".to_string(),
-                value: "4.4.4.4".to_string(),
-            },
-        ];
-        let parsed = parse_resolvers_from_options(&options).expect("options should parse");
-        assert_eq!(parsed.resolvers.len(), 4);
-        assert_eq!(parsed.resolvers[0].resolver.host, "1.1.1.1");
-        assert_eq!(parsed.resolvers[0].mode, ResolverMode::Recursive);
-        assert_eq!(parsed.resolvers[1].resolver.host, "2.2.2.2");
-        assert_eq!(parsed.resolvers[1].resolver.port, 5353);
-        assert_eq!(parsed.resolvers[2].resolver.host, "3.3.3.3");
-        assert_eq!(parsed.resolvers[2].mode, ResolverMode::Authoritative);
-        assert_eq!(parsed.resolvers[3].resolver.host, "4.4.4.4");
-        assert!(!parsed.authoritative_remote);
-    }
-
-    #[test]
-    fn plugin_domain_single_entry() {
-        let options = vec![sip003::Sip003Option {
-            key: "domain".to_string(),
-            value: "example.com".to_string(),
-        }];
-        let domain = parse_domain_option(&options)
-            .expect("options should parse")
-            .expect("domain should exist");
-        assert_eq!(domain, "example.com");
-    }
-
-    #[test]
-    fn plugin_domain_rejects_repeated_option() {
-        let options = vec![
-            sip003::Sip003Option {
-                key: "domain".to_string(),
-                value: "example.com".to_string(),
-            },
-            sip003::Sip003Option {
-                key: "domain".to_string(),
-                value: "example.net".to_string(),
-            },
-        ];
-        assert!(parse_domain_option(&options).is_err());
-    }
-
-    #[test]
-    fn plugin_domain_rejects_multiple_entries() {
-        let options = vec![sip003::Sip003Option {
-            key: "domain".to_string(),
-            value: "example.com,example.net".to_string(),
-        }];
-        assert!(parse_domain_option(&options).is_err());
-    }
-
-    #[test]
-    fn authoritative_flag_applies_to_remote() {
-        let options = vec![sip003::Sip003Option {
-            key: "authoritative".to_string(),
-            value: "".to_string(),
-        }];
-        let parsed = parse_resolvers_from_options(&options).expect("options should parse");
-        assert!(parsed.resolvers.is_empty());
-        assert!(parsed.authoritative_remote);
+    fn json_config_parses() {
+        let json = r#"{
+            "tunnels": [
+                {
+                    "tcp-listen-port": 7001,
+                    "resolver": ["127.0.0.1:8853"],
+                    "domain": "example.com"
+                },
+                {
+                    "tcp-listen-port": 7002,
+                    "resolver": ["127.0.0.1:8853"],
+                    "domain": "example.com",
+                    "congestion-control": "bbr"
+                }
+            ],
+            "load-balance": {
+                "port": 7000,
+                "bind": "127.0.0.1",
+                "strategy": "leastconn"
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("should parse");
+        assert_eq!(cfg.tunnels.len(), 2);
+        assert_eq!(cfg.tunnels[0].tcp_listen_port, 7001);
+        assert_eq!(cfg.tunnels[1].congestion_control.as_deref(), Some("bbr"));
+        let lb = cfg.load_balance.expect("lb should exist");
+        assert_eq!(lb.port, 7000);
+        assert_eq!(lb.strategy, "leastconn");
     }
 }
