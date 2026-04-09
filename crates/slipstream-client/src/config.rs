@@ -1,29 +1,5 @@
 use serde::Deserialize;
 
-/// Top-level JSON config file format.
-///
-/// Example:
-/// ```json
-/// {
-///   "tunnels": [
-///     {
-///       "tcp-listen-port": 7001,
-///       "resolver": ["127.0.0.1:8853"],
-///       "domain": "example.com"
-///     },
-///     {
-///       "tcp-listen-port": 7002,
-///       "resolver": ["127.0.0.1:8853"],
-///       "domain": "example.com"
-///     }
-///   ],
-///   "load-balance": {
-///     "port": 7000,
-///     "bind": "127.0.0.1",
-///     "strategy": "roundrobin"
-///   }
-/// }
-/// ```
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub tunnels: Vec<TunnelConfig>,
@@ -66,6 +42,21 @@ pub struct TunnelConfig {
     /// Enable GSO (default: false).
     #[serde(default)]
     pub gso: bool,
+
+    /// How often (in seconds) to transparently refresh the tunnel connection.
+    /// 0 = disabled (default).
+    #[serde(rename = "refresh-interval", default)]
+    pub refresh_interval_secs: u64,
+
+    /// How long (in seconds) to let old connections drain before the old
+    /// tunnel thread is allowed to exit. Default: 30.
+    #[serde(rename = "drain-secs", default = "default_drain_secs")]
+    pub drain_secs: u64,
+
+    /// Port offset used for the warm-standby alternate port.
+    /// Alternate port = tcp-listen-port + refresh-port-offset. Default: 10000.
+    #[serde(rename = "refresh-port-offset", default = "default_port_offset")]
+    pub refresh_port_offset: u16,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -82,18 +73,12 @@ pub struct LoadBalanceConfig {
     pub strategy: String,
 }
 
-fn default_host() -> String {
-    "::".to_string()
-}
-fn default_keep_alive() -> u16 {
-    400
-}
-fn default_bind() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_strategy() -> String {
-    "roundrobin".to_string()
-}
+fn default_host() -> String { "::".to_string() }
+fn default_keep_alive() -> u16 { 400 }
+fn default_bind() -> String { "127.0.0.1".to_string() }
+fn default_strategy() -> String { "roundrobin".to_string() }
+fn default_drain_secs() -> u64 { 30 }
+fn default_port_offset() -> u16 { 10000 }
 
 impl Config {
     pub fn from_file(path: &str) -> Result<Self, String> {
